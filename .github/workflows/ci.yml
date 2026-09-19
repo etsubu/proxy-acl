@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    uses: $/.github/workflows/checks.yml
+    permissions:
+      contents: read # check out the code
+
+  # Every push to main publishes ghcr.io/<owner>/proxy-acl:main (and
+  # :sha-<commit>) for trying out changes before a release.
+  image:
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: $/.github/workflows/image.yml
+    permissions:
+      contents: read # check out the code
+      packages: write # push the image
+      id-token: write # sign the attestation
+      attestations: write # store the attestation
+    with:
+      version: main-${{ github.sha }}
+      tags: main

@@ -1,0 +1,12 @@
+# Local development config for `make run`: lets this machine use the proxy
+# for anything, on any port, and logs every decision. Not for deployment.
+log_level: debug
+
+subnets:
+  - name: localhost
+    cidrs: [127.0.0.0/8, "::1"]
+    ports: ["1-65535"]
+    allow:
+      - "*" # any hostname
+      - 0.0.0.0/0 # any IPv4 address, including private ones
+      - ::/0 # any IPv6 address

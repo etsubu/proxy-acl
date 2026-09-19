@@ -1,0 +1,115 @@
+# Builds and publishes the release for a version tag: binaries and archives
+# for every platform, a checksum file, the multi-platform image, provenance
+# attestations for all of them, and the GitHub release.
+#
+# Started by Release. To retry a failed publish, run it by hand on the tag
+# (Use workflow from: Tags > vX.Y.Z).
+name: Publish
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  binaries:
+    name: Binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # check out the code
+      id-token: write # sign the attestation
+      attestations: write # store the attestation
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image-tags: ${{ steps.version.outputs.image-tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # a release must not reuse state from other runs
+      - name: Read the version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ ! $GITHUB_REF_NAME =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is not a release tag (vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          version=${GITHUB_REF_NAME#v}
+          IFS=. read -r major minor _ <<<"$version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "image-tags=$version $major.$minor $major latest" >>"$GITHUB_OUTPUT"
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/build-release.sh "$VERSION"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/proxy-acl_*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    needs: binaries
+    uses: $/.github/workflows/image.yml
+    permissions:
+      contents: read # check out the code
+      packages: write # push the image
+      id-token: write # sign the attestation
+      attestations: write # store the attestation
+    with:
+      version: ${{ needs.binaries.outputs.version }}
+      tags: ${{ needs.binaries.outputs.image-tags }}
+
+  release:
+    name: Release
+    needs: [binaries, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.binaries.outputs.version }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cat >notes.md <<EOF
+          **Image:** \`$IMAGE:$VERSION\` (\`$IMAGE@$DIGEST\`), for linux/amd64, linux/arm64 and linux/arm/v7.
+
+          Every file and the image have a signed provenance attestation. To check
+          that a download was built by this repository's workflow from $TAG:
+
+          \`\`\`sh
+          gh attestation verify proxy-acl_${VERSION}_linux_amd64.tar.gz --repo $REPO --source-ref refs/tags/$TAG
+          gh attestation verify oci://$IMAGE:$VERSION --repo $REPO --source-ref refs/tags/$TAG
+          sha256sum -c proxy-acl_${VERSION}_checksums.txt --ignore-missing
+          \`\`\`
+          EOF
+          # Upload everything to a draft first: once published, an immutable
+          # release can't be changed.
+          gh release create "$TAG" --repo "$REPO" --verify-tag --draft --title "$TAG" \
+            --notes-file notes.md --generate-notes dist/*
+          gh release edit "$TAG" --repo "$REPO" --draft=false

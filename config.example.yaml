@@ -1,0 +1,81 @@
+# proxy-acl configuration.
+#
+# Reloaded automatically when this file changes (or on SIGHUP). If the new
+# version fails to parse or validate, the previous config stays active and an
+# error is logged. Unknown or duplicate keys are errors.
+
+# debug | info | warn | error. Allowed requests are logged at info and denied
+# requests at warn, so "warn" shows only blocked traffic.
+log_level: info
+
+# Resource limits, so one misbehaving device can't starve the others. The
+# values shown are the defaults: generous, meant to contain a runaway device
+# rather than throttle normal use. 0 disables a limit. The client_* limits
+# and tunnel_idle_timeout can also be set per subnet (see "iot" below).
+limits:
+  total_connections: 20000 # all clients together
+  client_connections: 512 # per client IP, including open tunnels
+  client_requests_per_second: 200 # new requests/tunnels per client IP...
+  client_request_burst: 1000 # ...after an initial burst of this many
+  tunnel_idle_timeout: 1h # close tunnels with no data in either direction
+
+# EVERYTHING IS DENIED BY DEFAULT. A request is allowed only if:
+#   1. the client IP is in a subnet below (most specific CIDR wins, so a /32
+#      overrides the /24 it sits in),
+#   2. no deny rule matches (deny always wins over allow),
+#   3. an allow rule matches,
+#   4. the port is in the subnet's "ports" list (default: 80 and 443),
+#   5. none of the addresses the hostname resolves to matches a deny rule, and
+#      any non-public ones (LAN, loopback, link-local, ...) are allowed by an
+#      IP/CIDR rule. The proxy then connects only to those checked addresses.
+#
+# Rule patterns (case-insensitive):
+#   example.com           exact hostname
+#   .example.com          example.com and all of its subdomains
+#   "*.example.com"       subdomains at any depth, but not example.com itself
+#   "api-*.example.com"   "*" inside a label matches within that label only
+#   "*"                   any hostname (not IP addresses); in a deny list, everything
+#   '~^cdn\d+\.example\.net$'   regex (after "~"), always matched against the whole hostname
+#   203.0.113.10          IP address
+#   203.0.113.0/24        IP range
+#
+# Hostname rules match hostnames only; IP/CIDR rules match addresses, both
+# for clients connecting to an IP directly and for what hostnames resolve to.
+#
+# YAML gotchas: quote patterns starting with "*" (bare * is a YAML alias), and
+# use single quotes for regexes (double quotes treat backslashes as escapes).
+
+subnets:
+  - name: proxmox
+    cidrs: [10.0.10.0/24]
+    allow:
+      - .debian.org # deb.debian.org, security.debian.org, ...
+      - download.proxmox.com
+      - enterprise.proxmox.com
+
+  - name: iot
+    cidrs: [10.0.20.0/24]
+    # limits: # per-subnet overrides, for example:
+    #   client_connections: 128
+    allow:
+      - .netflix.com
+      - .netflix.net
+      - .nflxvideo.net
+      - .nflximg.net
+      - .nflxext.com
+      - .nflxso.net
+
+  - name: lan
+    cidrs: [10.0.1.0/24, "fd00:1::/64"]
+    ports: [80, 443, 22, "8000-8999"]
+    allow:
+      - "*"
+      - 10.0.1.5 # the NAS: private addresses must be allowed by IP, even via "*"
+    deny:
+      - .doubleclick.net
+      - '~(.+\.)?telemetry\..+'
+      - 203.0.113.0/24 # blocks these IPs whether requested directly or via DNS
+
+  # Overrides "lan" for a single host: no allow rules, so nothing is allowed.
+  - name: printer
+    cidrs: [10.0.1.50/32]

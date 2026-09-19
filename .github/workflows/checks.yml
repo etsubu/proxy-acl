@@ -1,0 +1,66 @@
+# Tests, vulnerability scan and builds. Called by CI and before every release.
+name: Checks
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Run gofmt on:"; echo "$unformatted"; exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Vulnerability check
+        run: go tool govulncheck ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+      - name: Fuzz ACL
+        run: go test ./internal/acl -run '^$' -fuzz '^FuzzCheck$' -fuzztime 60s
+
+  build:
+    name: Build
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build release binaries for every platform
+        run: scripts/build-release.sh "$(scripts/version.sh)"
+      - name: Build image
+        run: docker build -t proxy-acl:ci --build-arg VERSION=ci .
+      - name: Smoke test image
+        run: |
+          docker run -d --name proxy-acl -p 3128:3128 \
+            -v "$PWD/config.example.yaml:/etc/proxy-acl/config.yaml:ro" proxy-acl:ci
+          sleep 2
+          # The runner isn't in any configured subnet, so the proxy must drop
+          # the connection without answering (curl reports status 000).
+          code=$(curl -s -o /dev/null -w '%{http_code}' -x http://127.0.0.1:3128 http://example.com/ || true)
+          docker logs proxy-acl
+          test "$code" = 000
+          docker logs proxy-acl 2>&1 | grep -q '"reason":"client not in any subnet"'

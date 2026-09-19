@@ -1,0 +1,80 @@
+# Builds the multi-platform image, pushes it to ghcr.io/<owner>/<repo> and
+# attests its provenance. Called by CI (main) and Publish (releases).
+name: Image
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version built into the binary
+        type: string
+        required: true
+      tags:
+        description: Space-separated image tags; sha-<commit> is always added
+        type: string
+        required: true
+    outputs:
+      image:
+        description: Image name without tag
+        value: ${{ jobs.image.outputs.image }}
+      digest:
+        description: Digest of the multi-platform image index
+        value: ${{ jobs.image.outputs.digest }}
+
+permissions: {}
+
+jobs:
+  image:
+    name: Image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out the code
+      packages: write # push the image
+      id-token: write # sign the attestation
+      attestations: write # store the attestation
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    env:
+      # The builder runs in this pinned BuildKit image. Update it by hand:
+      # docker buildx imagetools inspect moby/buildkit:<version>
+      BUILDKIT_IMAGE: moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+      PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and push
+        id: build
+        env:
+          VERSION: ${{ inputs.version }}
+          TAGS: ${{ inputs.tags }}
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          # No build cache: a release must never reuse layers from other runs.
+          docker buildx create --name publish --driver docker-container \
+            --driver-opt "image=$BUILDKIT_IMAGE" --use
+
+          args=()
+          for tag in $TAGS "sha-${GITHUB_SHA::7}"; do
+            args+=(--tag "$image:$tag")
+          done
+          # The source label links the package to this repository on GitHub.
+          for kv in "source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "revision=$GITHUB_SHA" "version=$VERSION"; do
+            args+=(--label "org.opencontainers.image.$kv" --annotation "index:org.opencontainers.image.$kv")
+          done
+          docker buildx build --platform "$PLATFORMS" --build-arg "VERSION=$VERSION" "${args[@]}" \
+            --provenance=false --sbom=false --push --metadata-file meta.json .
+
+          echo "image=$image" >>"$GITHUB_OUTPUT"
+          echo "digest=$(jq -r '."containerimage.digest"' meta.json)" >>"$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.build.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

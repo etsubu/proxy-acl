@@ -1,0 +1,73 @@
+# Cuts a release: runs the checks, tags the commit that passed them with the
+# next version (vX.Y.Z, bumped from the highest existing release tag) and
+# starts Publish on that tag. Versions live only in git tags.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increase
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    if: github.ref == 'refs/heads/main'
+    uses: $/.github/workflows/checks.yml
+    permissions:
+      contents: read # check out the code
+
+  tag:
+    name: Tag
+    needs: checks
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the tag
+      actions: write # start the Publish workflow
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # all tags, to find the current version
+      - name: Tag the tested commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          released=$(git tag --points-at "$COMMIT" --list 'v*' |
+            { grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || true; })
+          if [ -n "$released" ]; then
+            echo "::error::$COMMIT is already released as $released"
+            exit 1
+          fi
+          version=$(scripts/next-version.sh "$BUMP")
+          tag="v$version"
+
+          # An annotated tag on exactly the commit the checks ran on. Creating
+          # the ref fails if the tag already exists.
+          object=$(jq -n --arg tag "$tag" --arg sha "$COMMIT" \
+            '{tag: $tag, message: ("Release " + $tag), object: $sha, type: "commit"}' |
+            gh api "repos/$REPO/git/tags" --input - --jq .sha)
+          jq -n --arg ref "refs/tags/$tag" --arg sha "$object" '{ref: $ref, sha: $sha}' |
+            gh api "repos/$REPO/git/refs" --input - >/dev/null
+
+          # Publishing runs from the tag, so the attestations name the tag and
+          # its commit as the source.
+          gh workflow run publish.yml --repo "$REPO" --ref "$tag"
+          {
+            echo "Tagged **$tag** at \`$COMMIT\`."
+            echo "Publishing: $GITHUB_SERVER_URL/$REPO/actions/workflows/publish.yml"
+          } >>"$GITHUB_STEP_SUMMARY"
