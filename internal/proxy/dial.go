@@ -28,23 +28,14 @@ const (
 	minAttemptTimeout = 2 * time.Second
 )
 
-type vettedKey struct{}
-
 // vetted is an ACL-approved destination: the requested host and port, and
-// the addresses the ACL checked for it.
+// the addresses the ACL checked for it. Nothing dials without one, so there
+// is no code path that can reach an unchecked address.
 type vetted struct {
 	host  string
 	port  uint16
 	addrs []netip.Addr
 	idle  time.Duration // tunnel idle timeout
-}
-
-func dialVetted(ctx context.Context, network, addr string) (net.Conn, error) {
-	v, _ := ctx.Value(vettedKey{}).(*vetted)
-	if v == nil {
-		return nil, errNotVetted
-	}
-	return v.dial(ctx, network, addr)
 }
 
 // dial connects to the vetted addresses only. addr must be the host:port
@@ -112,7 +103,7 @@ func dialParallel(ctx context.Context, network string, addrs []netip.Addr, port 
 					// The loser is cancelled, but may connect anyway.
 					go func() {
 						if l := <-results; l.c != nil {
-							l.c.Close()
+							_ = l.c.Close()
 						}
 					}()
 				}

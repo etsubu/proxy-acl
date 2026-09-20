@@ -1,5 +1,7 @@
 .DEFAULT_GOAL := help
 
+GOLANGCI_VERSION ?= v2.13.2
+
 VERSION  ?= $(shell scripts/version.sh)
 CONFIG   ?= config.dev.yaml
 LISTEN   ?= 127.0.0.1:3128
@@ -7,7 +9,7 @@ FUZZTIME ?= 60s
 
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: help build run test fuzz vulncheck fmt check release image clean
+.PHONY: help build run test fuzz vulncheck lint lint-fix fmt check release image clean
 
 help: ## Show the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -29,13 +31,24 @@ fuzz: ## Fuzz the ACL for FUZZTIME
 vulncheck: ## Check dependencies for known vulnerabilities
 	go tool govulncheck ./...
 
+bin/golangci-lint: # Downloaded on demand by the lint targets
+	@mkdir -p bin
+	GOBIN=$(CURDIR)/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
+
+lint: bin/golangci-lint ## Run the quality gate (.golangci.yml)
+	bin/golangci-lint run ./...
+
+lint-fix: bin/golangci-lint ## Apply the fixes the linters can make themselves
+	bin/golangci-lint run --fix ./...
+	bin/golangci-lint fmt ./...
+
 fmt: ## Format the code
 	gofmt -w .
 
-check: ## Everything CI checks: formatting, vet, vulncheck, tests
+check: ## Everything CI checks: formatting, vet, lint, vulncheck, tests
 	@test -z "$$(gofmt -l .)" || { echo "Not formatted (run make fmt):"; gofmt -l .; exit 1; }
 	go vet ./...
-	$(MAKE) --no-print-directory vulncheck test
+	$(MAKE) --no-print-directory lint vulncheck test
 
 release: ## Build the release binaries and archives into dist/, as CI does
 	scripts/build-release.sh "$(VERSION)"

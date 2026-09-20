@@ -31,16 +31,23 @@ type Resolver interface {
 
 // Policy is a compiled, immutable ACL. It is safe for concurrent use.
 type Policy struct {
-	subnets []*subnet
+	subnets []*Subnet
 }
 
-type subnet struct {
+// Subnet is one client subnet's compiled rules, and the handle SubnetOf
+// returns. Callers that need more than the decision itself (per-subnet
+// limits, log fields) look the subnet up once and pass it on, so a request
+// costs a single scan over the configured prefixes.
+type Subnet struct {
 	name     string
 	prefixes []netip.Prefix
 	ports    []portRange
 	allow    ruleSet
 	deny     ruleSet
 }
+
+// Name returns the subnet's name from the config.
+func (s *Subnet) Name() string { return s.name }
 
 // Decision is the outcome of a policy check.
 type Decision struct {
@@ -85,8 +92,8 @@ func New(specs []SubnetSpec) (*Policy, error) {
 	return p, nil
 }
 
-func compileSubnet(spec SubnetSpec) (*subnet, error) {
-	s := &subnet{name: spec.Name, ports: defaultPorts}
+func compileSubnet(spec SubnetSpec) (*Subnet, error) {
+	s := &Subnet{name: spec.Name, ports: defaultPorts}
 	if len(spec.CIDRs) == 0 {
 		return nil, errors.New("no cidrs defined")
 	}
@@ -124,21 +131,40 @@ func compileSubnet(spec SubnetSpec) (*subnet, error) {
 	return s, nil
 }
 
-// SubnetCount returns the number of configured subnets.
-func (p *Policy) SubnetCount() int { return len(p.subnets) }
+// Subnets returns the compiled subnets in config order.
+func (p *Policy) Subnets() []*Subnet { return p.subnets }
 
-// SubnetOf returns the name of the subnet client belongs to, if any.
-func (p *Policy) SubnetOf(client netip.Addr) (string, bool) {
-	if s := p.subnetFor(client); s != nil {
-		return s.name, true
+// SubnetOf returns the subnet client belongs to, or nil. The longest
+// matching prefix wins, so a /32 entry can override the /24 it belongs to.
+func (p *Policy) SubnetOf(client netip.Addr) *Subnet {
+	client = client.Unmap()
+	var best *Subnet
+	bestBits := -1
+	for _, s := range p.subnets {
+		for _, pfx := range s.prefixes {
+			if pfx.Bits() > bestBits && pfx.Contains(client) {
+				best, bestBits = s, pfx.Bits()
+			}
+		}
 	}
-	return "", false
+	return best
 }
 
-// Check decides whether client may connect to host:port. In order:
+// Check looks up the client's subnet and checks the request against it.
+// Callers that already hold the subnet should use Subnet.Check instead.
+func (p *Policy) Check(ctx context.Context, res Resolver, client netip.Addr, host, port string) Decision {
+	s := p.SubnetOf(client)
+	if s == nil {
+		return Decision{Reason: "client not in any subnet"}
+	}
+	return s.Check(ctx, res, host, port)
+}
+
+// Check decides whether a client of this subnet may connect to host:port.
+// In order:
 //
-//   - the client must belong to a subnet, the host must be a valid hostname
-//     or IP literal, and the port a valid number;
+//   - the host must be a valid hostname or IP literal, and the port a valid
+//     number;
 //   - deny rules win over allow rules; an allow rule must match; the port
 //     must be in the subnet's port list;
 //   - an allowed hostname is resolved (only then, so denied names never
@@ -148,11 +174,7 @@ func (p *Policy) SubnetOf(client netip.Addr) (string, bool) {
 //
 // The caller must connect only to Decision.Addrs, never re-resolve the
 // name, or DNS rebinding could swap in an address that was never checked.
-func (p *Policy) Check(ctx context.Context, res Resolver, client netip.Addr, host, port string) Decision {
-	s := p.subnetFor(client)
-	if s == nil {
-		return Decision{Reason: "client not in any subnet"}
-	}
+func (s *Subnet) Check(ctx context.Context, res Resolver, host, port string) Decision {
 	d := Decision{Subnet: s.name}
 	deny := func(reason, rule string) Decision {
 		d.Reason, d.Rule = reason, rule
@@ -200,23 +222,7 @@ func (p *Policy) Check(ctx context.Context, res Resolver, client netip.Addr, hos
 	return d
 }
 
-// subnetFor returns the subnet with the longest prefix containing ip, so a
-// /32 entry can override the /24 it belongs to.
-func (p *Policy) subnetFor(ip netip.Addr) *subnet {
-	ip = ip.Unmap()
-	var best *subnet
-	bestBits := -1
-	for _, s := range p.subnets {
-		for _, pfx := range s.prefixes {
-			if pfx.Bits() > bestBits && pfx.Contains(ip) {
-				best, bestBits = s, pfx.Bits()
-			}
-		}
-	}
-	return best
-}
-
-func (s *subnet) allowsPort(port uint16) bool {
+func (s *Subnet) allowsPort(port uint16) bool {
 	for _, r := range s.ports {
 		if r.contains(port) {
 			return true

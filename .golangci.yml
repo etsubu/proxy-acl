@@ -1,0 +1,72 @@
+# Quality gate for CI and `make lint`. Run it with:
+#
+#	make lint        # report
+#	make lint-fix    # apply what can be fixed automatically
+#
+# The set is deliberately small: every linter here either found a real
+# problem in this code or guards a mistake that would be expensive in a
+# proxy (leaked connections, unchecked errors, requests without a context).
+# Suppressions must be `//nolint:<linter> // <reason>` with the reason
+# spelled out, which nolintlint enforces.
+version: "2"
+
+linters:
+  # The standard set is errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - bodyclose       # an unclosed response body leaks an upstream connection
+    - contextcheck    # a dropped context breaks cancellation and timeouts
+    - durationcheck   # time arithmetic that silently produces nonsense
+    - errorlint       # == on errors misses wrapped ones
+    - forcetypeassert # an unchecked assertion panics on unexpected input
+    - gocritic
+    - gosec
+    - makezero
+    - misspell
+    - nilerr          # returning nil after a non-nil error
+    - nolintlint      # every suppression must say why
+    - noctx           # outbound requests must carry a context
+    - predeclared
+    - revive
+    - unconvert
+    - usestdlibvars
+    - wastedassign
+
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # struct layout is not worth the readability cost here
+        - shadow # flags the idiomatic `if err := f(); err != nil`
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+    revive:
+      rules:
+        - name: exported
+        - name: error-return
+        - name: unused-parameter
+        - name: context-as-argument
+        - name: errorf
+        - name: indent-error-flow
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Tests may ignore errors, dial without a context and leave bodies to
+      # the garbage collector: a leak there fails the test, not production.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - forcetypeassert
+          - gosec
+          - noctx
+
+formatters:
+  enable:
+    - gofmt

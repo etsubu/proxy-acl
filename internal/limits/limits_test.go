@@ -1,6 +1,7 @@
 package limits
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -31,14 +32,14 @@ func TestConnectionLimits(t *testing.T) {
 	if err1 != nil || err2 != nil {
 		t.Fatal(err1, err2)
 	}
-	if _, err := tr.Acquire(ipA, lim, 3); err != ErrClientConnections {
+	if _, err := tr.Acquire(ipA, lim, 3); !errors.Is(err, ErrClientConnections) {
 		t.Errorf("third connection for A: %v", err)
 	}
 	rb, err := tr.Acquire(ipB, lim, 3) // B has its own allowance
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tr.Acquire(ipB, lim, 3); err != ErrTotalConnections {
+	if _, err := tr.Acquire(ipB, lim, 3); !errors.Is(err, ErrTotalConnections) {
 		t.Errorf("fourth connection overall: %v", err)
 	}
 
@@ -166,7 +167,7 @@ func TestTrackedClientsAreBounded(t *testing.T) {
 	if _, err := tr.Acquire(netip.MustParseAddr("2001:db8:2::1"), lim, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tr.Acquire(netip.MustParseAddr("2001:db8:2::2"), lim, 0); err != ErrClientConnections {
+	if _, err := tr.Acquire(netip.MustParseAddr("2001:db8:2::2"), lim, 0); !errors.Is(err, ErrClientConnections) {
 		t.Errorf("same /64 should share a budget: %v", err)
 	}
 	if _, err := tr.Acquire(netip.MustParseAddr("2001:db8:3::1"), lim, 0); err != nil {

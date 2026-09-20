@@ -1,4 +1,4 @@
-# Tests, vulnerability scan and builds. Called by CI and before every release.
+# Lint, tests, vulnerability scan and builds. Called by CI and before every release.
 name: Checks
 
 on:
@@ -7,6 +7,31 @@ on:
 permissions: {}
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # The version is pinned in the Makefile, so `make lint` locally and CI
+      # run exactly the same linters and can't drift apart.
+      - name: Read the pinned golangci-lint version
+        id: golangci
+        run: |
+          version=$(sed -n 's/^GOLANGCI_VERSION ?= //p' Makefile)
+          test -n "$version" || { echo "::error::GOLANGCI_VERSION not found in Makefile"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ steps.golangci.outputs.version }}
+
   test:
     name: Test
     runs-on: ubuntu-24.04
@@ -37,7 +62,7 @@ jobs:
 
   build:
     name: Build
-    needs: test
+    needs: [lint, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -21,17 +20,22 @@ const reloadDebounce = 250 * time.Millisecond
 // Store holds the active config and swaps it atomically on reload, so
 // in-flight requests never see a half-applied config.
 type Store struct {
-	path string
-	cur  atomic.Pointer[Config]
+	path  string
+	apply func(*Config)
+	cur   atomic.Pointer[Config]
 }
 
 // NewStore loads the config at path. It fails if the initial load fails.
-func NewStore(path string) (*Store, error) {
+//
+// apply, if non-nil, is called with every config that becomes active,
+// starting with this one. Settings that live outside the Config value
+// itself belong there rather than in a side effect of loading.
+func NewStore(path string, apply func(*Config)) (*Store, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{path: abs}
+	s := &Store{path: abs, apply: apply}
 	return s, s.Reload()
 }
 
@@ -45,8 +49,10 @@ func (s *Store) Reload() error {
 		return err
 	}
 	s.cur.Store(cfg)
-	zerolog.SetGlobalLevel(cfg.LogLevel)
-	log.Info().Str("path", s.path).Int("subnets", cfg.Policy.SubnetCount()).Msg("config loaded")
+	if s.apply != nil {
+		s.apply(cfg)
+	}
+	log.Info().Str("path", s.path).Int("subnets", len(cfg.Policy.Subnets())).Msg("config loaded")
 	return nil
 }
 
@@ -60,7 +66,7 @@ func (s *Store) Watch(ctx context.Context) error {
 	// Watch the directory rather than the file: editors and config management
 	// tools often replace the file via rename, which would orphan a file watch.
 	if err := w.Add(filepath.Dir(s.path)); err != nil {
-		w.Close()
+		_ = w.Close()
 		return err
 	}
 	go s.watchLoop(ctx, w)
@@ -68,7 +74,7 @@ func (s *Store) Watch(ctx context.Context) error {
 }
 
 func (s *Store) watchLoop(ctx context.Context, w *fsnotify.Watcher) {
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)

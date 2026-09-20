@@ -9,14 +9,13 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/elazarl/goproxy"
 )
 
 const (
-	maxUpstreamPools      = 1024
-	upstreamIdleTimeout   = 30 * time.Second
-	maxIdlePerDestination = 32
+	maxResponseHeaderBytes = 1 << 20
+	maxUpstreamPools       = 1024
+	upstreamIdleTimeout    = 30 * time.Second
+	maxIdlePerDestination  = 32
 )
 
 // upstreamPools reuses plain-HTTP upstream connections, but only between
@@ -39,10 +38,11 @@ func newUpstreamPools() *upstreamPools {
 	return &upstreamPools{pools: map[string]*upstreamPool{}}
 }
 
-// RoundTrip implements goproxy.RoundTripper.
-func (u *upstreamPools) RoundTrip(req *http.Request, _ *goproxy.ProxyCtx) (*http.Response, error) {
-	v, _ := req.Context().Value(vettedKey{}).(*vetted)
-	if v == nil {
+// roundTrip sends req to the vetted destination v. Taking v as an argument
+// rather than reading it back out of the request is what makes an unchecked
+// request impossible to send: there is no call without one.
+func (u *upstreamPools) roundTrip(req *http.Request, v *vetted) (*http.Response, error) {
+	if v == nil || len(v.addrs) == 0 {
 		return nil, errNotVetted
 	}
 	return u.transport(req.URL.Scheme, v).RoundTrip(req)
@@ -58,7 +58,7 @@ func (u *upstreamPools) transport(scheme string, v *vetted) *http.Transport {
 		return p.tr
 	}
 	if len(u.pools) >= maxUpstreamPools {
-		u.evictLocked(now, 0)
+		u.dropOldestLocked()
 	}
 	tr := newUpstreamTransport(v.dial)
 	u.pools[key] = &upstreamPool{tr: tr, used: now}
@@ -69,22 +69,25 @@ func (u *upstreamPools) transport(scheme string, v *vetted) *http.Transport {
 func (u *upstreamPools) sweep() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.evictLocked(time.Now(), upstreamIdleTimeout)
-}
-
-// evictLocked drops pools unused for longer than maxIdle, or with maxIdle
-// 0, the least recently used one. u.mu must be held.
-func (u *upstreamPools) evictLocked(now time.Time, maxIdle time.Duration) {
-	var oldest string
+	now := time.Now()
 	for k, p := range u.pools {
-		if maxIdle > 0 && now.Sub(p.used) > maxIdle {
+		if now.Sub(p.used) > upstreamIdleTimeout {
 			p.tr.CloseIdleConnections()
 			delete(u.pools, k)
-		} else if oldest == "" || p.used.Before(u.pools[oldest].used) {
+		}
+	}
+}
+
+// dropOldestLocked makes room by evicting the least recently used pool.
+// u.mu must be held.
+func (u *upstreamPools) dropOldestLocked() {
+	var oldest string
+	for k, p := range u.pools {
+		if oldest == "" || p.used.Before(u.pools[oldest].used) {
 			oldest = k
 		}
 	}
-	if maxIdle == 0 && oldest != "" {
+	if oldest != "" {
 		u.pools[oldest].tr.CloseIdleConnections()
 		delete(u.pools, oldest)
 	}

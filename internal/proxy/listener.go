@@ -6,10 +6,10 @@ import (
 	"net/netip"
 )
 
-// Listener wraps ln so connections are vetted as they are accepted: clients
+// listener wraps ln so connections are vetted as they are accepted: clients
 // outside every subnet are dropped before anything is read from them, and
 // the per-client and total connection limits are enforced.
-func (p *Proxy) Listener(ln net.Listener) net.Listener {
+func (p *Proxy) listener(ln net.Listener) net.Listener {
 	return &listener{Listener: ln, p: p}
 }
 
@@ -33,16 +33,16 @@ func (l *listener) Accept() (net.Conn, error) {
 func (p *Proxy) admit(c net.Conn) net.Conn {
 	client := remoteAddr(c.RemoteAddr())
 	cfg := p.config()
-	subnet, ok := cfg.Policy.SubnetOf(client)
-	if !ok {
+	subnet := cfg.Policy.SubnetOf(client)
+	if subnet == nil {
 		p.logRejected(client, "", "client not in any subnet")
-		c.Close()
+		_ = c.Close()
 		return nil
 	}
 	release, err := p.clients.Acquire(client, cfg.ClientLimits(subnet), cfg.TotalConnections)
 	if err != nil {
-		p.logRejected(client, subnet, err.Error())
-		c.Close()
+		p.logRejected(client, subnet.Name(), err.Error())
+		_ = c.Close()
 		return nil
 	}
 	return &clientConn{Conn: c, release: release}

@@ -39,6 +39,7 @@ type Lookuper interface {
 	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
+// Resolver is a caching Lookuper. The zero value is not usable; use New.
 type Resolver struct {
 	next   Lookuper
 	now    func() time.Time
@@ -77,6 +78,7 @@ func WithClient(ctx context.Context, client netip.Addr) context.Context {
 	return context.WithValue(ctx, clientKey{}, client)
 }
 
+// New returns a Resolver that caches lookups made through next.
 func New(next Lookuper) *Resolver {
 	return &Resolver{
 		next:    next,
@@ -88,16 +90,18 @@ func New(next Lookuper) *Resolver {
 	}
 }
 
+// LookupNetIP resolves host, serving a fresh cache entry or joining a
+// lookup already in flight for the same name where it can.
 func (r *Resolver) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
 	key := network + "|" + host
 	r.mu.Lock()
-	f, addrs, err, ok := r.findLocked(key)
+	f, cached := r.findLocked(key)
 	r.mu.Unlock()
-	if ok {
-		if f != nil {
-			return r.wait(ctx, f)
-		}
-		return addrs, err
+	if f != nil {
+		return r.wait(ctx, f)
+	}
+	if cached != nil {
+		return slices.Clone(cached.addrs), cached.err
 	}
 
 	// Starting a new lookup takes one of the client's slots, held until
@@ -107,13 +111,14 @@ func (r *Resolver) LookupNetIP(ctx context.Context, network, host string) ([]net
 		return nil, err
 	}
 	r.mu.Lock()
-	if f, addrs, err, ok := r.findLocked(key); ok { // done or started while we waited
+	f, cached = r.findLocked(key) // done or started while we waited
+	if f != nil || cached != nil {
 		r.mu.Unlock()
 		release()
 		if f != nil {
 			return r.wait(ctx, f)
 		}
-		return addrs, err
+		return slices.Clone(cached.addrs), cached.err
 	}
 	f = &flight{done: make(chan struct{})}
 	r.flights[key] = f
@@ -123,16 +128,13 @@ func (r *Resolver) LookupNetIP(ctx context.Context, network, host string) ([]net
 	return r.wait(ctx, f)
 }
 
-// findLocked returns a fresh cache entry or the lookup in flight for key.
-// r.mu must be held.
-func (r *Resolver) findLocked(key string) (*flight, []netip.Addr, error, bool) {
+// findLocked returns the lookup in flight for key, or a fresh cache entry,
+// or neither if the name has to be looked up. r.mu must be held.
+func (r *Resolver) findLocked(key string) (*flight, *entry) {
 	if e, ok := r.entries[key]; ok && r.now().Before(e.expires) {
-		return nil, slices.Clone(e.addrs), e.err, true
+		return nil, &e
 	}
-	if f, ok := r.flights[key]; ok {
-		return f, nil, nil, true
-	}
-	return nil, nil, nil, false
+	return r.flights[key], nil
 }
 
 func (r *Resolver) wait(ctx context.Context, f *flight) ([]netip.Addr, error) {

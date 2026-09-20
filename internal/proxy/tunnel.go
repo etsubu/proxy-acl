@@ -46,8 +46,8 @@ func (t *tunnelState) idleFor() time.Duration {
 
 func (t *tunnelState) closeBoth() {
 	t.closeOnce.Do(func() {
-		t.client.Close()
-		t.upstream.Close()
+		_ = t.client.Close()
+		_ = t.upstream.Close()
 	})
 }
 
@@ -64,7 +64,7 @@ func (t *tunnelState) pipe(dst, src net.Conn) (int64, error) {
 	var total int64
 	for {
 		if t.idle > 0 {
-			src.SetReadDeadline(time.Now().Add(check))
+			_ = src.SetReadDeadline(time.Now().Add(check))
 		}
 		n, err := io.Copy(dst, src)
 		total += n
@@ -84,7 +84,7 @@ func (t *tunnelState) pipe(dst, src net.Conn) (int64, error) {
 func (t *tunnelState) finish(dst net.Conn, err error) error {
 	if err == nil { // src reached EOF
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
+			_ = cw.CloseWrite()
 			return nil
 		}
 	}

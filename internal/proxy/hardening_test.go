@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,7 +44,7 @@ func (e *env) dialProxy(t *testing.T, src string) net.Conn {
 	if src != "" {
 		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(src)}
 	}
-	c, err := d.Dial("tcp", e.proxy.Listener.Addr().String())
+	c, err := d.Dial("tcp", e.addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,16 +135,20 @@ func TestClientConnectionLimit(t *testing.T) {
 func TestConnectionSlotsAreReleased(t *testing.T) {
 	e := newEnv(t, defaultAllow, nil)
 	hangup := e.startTCP(t, func(net.Conn) {})
-	e.setConfig(t, defaultAllow, nil, map[string]any{"client_connections": 2})
+	// Comfortably above the few connections one round has in flight at once.
+	// A slot is released when the proxy notices the close, which is not
+	// synchronous with the client closing, so a tighter limit would race the
+	// test rather than test the code; a leak still shows in the final count.
+	e.setConfig(t, defaultAllow, nil, map[string]any{"client_connections": 8})
 
 	for i := range 15 {
 		c, _, resp := e.openTunnel(t, "allowed.test:"+e.tlsPort) // tunnel, closed by the client
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("round %d: tunnel status %d", i, resp.StatusCode)
 		}
 		c.Close()
 		c, _, resp = e.openTunnel(t, "denied.test:"+e.tlsPort) // CONNECT refused
-		if resp.StatusCode != 403 {
+		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("round %d: denied CONNECT status %d", i, resp.StatusCode)
 		}
 		c.Close()
@@ -262,7 +267,7 @@ func TestTunnelIdleTimeout(t *testing.T) {
 
 	t.Run("activity keeps it open", func(t *testing.T) {
 		c, br, resp := e.openTunnel(t, "allowed.test:"+echo)
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != http.StatusOK {
 			t.Fatal(resp.Status)
 		}
 		var last time.Time
@@ -387,7 +392,7 @@ func TestDialFallsBackToOtherFamily(t *testing.T) {
 }
 
 func TestDialFallsBackAtOnceOnFailure(t *testing.T) {
-	withDialer(t, 5*time.Second, time.Hour, func(ctx context.Context, addr string) (net.Conn, error) {
+	withDialer(t, 5*time.Second, time.Hour, func(_ context.Context, addr string) (net.Conn, error) {
 		if strings.HasPrefix(addr, "[") {
 			return nil, errors.New("unreachable")
 		}
@@ -437,7 +442,7 @@ func TestDialLimitsAttemptsAndTime(t *testing.T) {
 
 func TestDialClosesLosingConnection(t *testing.T) {
 	loser := &fakeConn{name: "loser"}
-	withDialer(t, 5*time.Second, 20*time.Millisecond, func(ctx context.Context, addr string) (net.Conn, error) {
+	withDialer(t, 5*time.Second, 20*time.Millisecond, func(_ context.Context, addr string) (net.Conn, error) {
 		if strings.HasPrefix(addr, "[") {
 			time.Sleep(100 * time.Millisecond) // connects late, ignoring cancellation
 			return loser, nil
@@ -501,9 +506,10 @@ const logBurstForTest = 200
 func TestUnknownClientsAreNotTracked(t *testing.T) {
 	e := newEnv(t, defaultAllow, nil)
 	logs := captureLogs(t)
-	for i := range 210 {
+	const attempts = 2 * logBurstForTest // enough that the budget runs out
+	for i := range attempts {
 		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, byte(2+i%3))}, Timeout: time.Second}
-		c, err := d.Dial("tcp", e.proxy.Listener.Addr().String())
+		c, err := d.Dial("tcp", e.addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -514,19 +520,29 @@ func TestUnknownClientsAreNotTracked(t *testing.T) {
 		t.Errorf("rejected clients created %d tracker entries", n)
 	}
 	e.p.sweep()
-	if out := logs(); !strings.Contains(out, `"suppressed":10,"clients":{`) || !strings.Contains(out, "connections from unknown clients suppressed") {
-		t.Errorf("missing unknown-client summary:\n%.1500s", out[max(0, len(out)-1500):])
+
+	out := logs()
+	m := regexp.MustCompile(`"suppressed":(\d+),"clients":\{([^}]*)\}`).FindStringSubmatch(out)
+	if m == nil || !strings.Contains(out, "connections from unknown clients suppressed") {
+		t.Fatalf("missing unknown-client summary:\n%.1500s", out[max(0, len(out)-1500):])
+	}
+	// The budget refills while the loop runs, so the exact count depends on
+	// how fast the machine is. Only the shape is asserted: clearly more than
+	// none were suppressed, never more than were attempted, and every client
+	// is accounted for by address.
+	if n, _ := strconv.Atoi(m[1]); n < attempts/4 || n > attempts-logBurstForTest {
+		t.Errorf("suppressed = %d, want between %d and %d", n, attempts/4, attempts-logBurstForTest)
+	}
+	for _, ip := range []string{"127.0.0.2", "127.0.0.3", "127.0.0.4"} {
+		if !strings.Contains(m[2], `"`+ip+`":`) {
+			t.Errorf("summary doesn't account for %s: %s", ip, m[2])
+		}
 	}
 }
 
 func TestDNSCacheWiredEndToEnd(t *testing.T) {
 	e := newEnv(t, defaultAllow, nil)
-	p := New(e.cfg.Load, dnscache.New(e.res)) // as in main
-	srv := httptest.NewUnstartedServer(p)
-	srv.Listener = p.Listener(srv.Listener)
-	srv.Start()
-	defer srv.Close()
-	e.proxy = srv
+	e.addr = serve(t, New(e.cfg.Load, dnscache.New(e.res))) // as in main
 	for _, u := range []string{"http://allowed.test:" + e.plainPort + "/", "https://allowed.test:" + e.tlsPort + "/"} {
 		for range 2 {
 			if code, err := e.get(u); err != nil || code != 200 {
@@ -554,12 +570,7 @@ func TestSlowDNSClientDoesNotStallOthers(t *testing.T) {
 	e := newEnv(t, defaultAllow, nil)
 	e.cidrs = []string{"127.0.0.1/32", "127.0.0.3/32"}
 	e.setConfig(t, []string{"*", "127.0.0.1"}, nil, nil)
-	p := New(e.cfg.Load, dnscache.New(slowResolver{e.res}))
-	srv := httptest.NewUnstartedServer(p)
-	srv.Listener = p.Listener(srv.Listener)
-	srv.Start()
-	defer srv.Close()
-	e.proxy = srv
+	e.addr = serve(t, New(e.cfg.Load, dnscache.New(slowResolver{e.res})))
 
 	// A device at 127.0.0.3 retries names whose DNS never answers, more
 	// of them at once than the proxy's total lookup capacity.
@@ -574,7 +585,7 @@ func TestSlowDNSClientDoesNotStallOthers(t *testing.T) {
 	}()
 	for i := range 300 {
 		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 3)}}
-		c, err := d.Dial("tcp", srv.Listener.Addr().String())
+		c, err := d.Dial("tcp", e.addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -628,8 +639,10 @@ func TestPoolNotReusedForOtherAddresses(t *testing.T) {
 func TestPoolFailsClosedWithoutVetting(t *testing.T) {
 	e := newEnv(t, defaultAllow, nil)
 	req, _ := http.NewRequest(http.MethodGet, e.plain.URL, nil)
-	if _, err := e.p.upstream.RoundTrip(req, nil); !errors.Is(err, errNotVetted) {
-		t.Errorf("unvetted request: %v, want errNotVetted", err)
+	for _, v := range []*vetted{nil, {host: "allowed.test", port: 80}} {
+		if _, err := e.p.upstream.roundTrip(req, v); !errors.Is(err, errNotVetted) {
+			t.Errorf("vetted %+v: %v, want errNotVetted", v, err)
+		}
 	}
 	if e.hits.Load() != 0 {
 		t.Error("backend reached")
@@ -683,5 +696,109 @@ func TestPoolsAreBounded(t *testing.T) {
 	u.sweep()
 	if n := len(u.pools); n != 1 {
 		t.Errorf("%d pools after sweeping idle ones, want 1", n)
+	}
+}
+
+// A destination that answers a plain request with a protocol upgrade must
+// not be able to take the client connection away from the proxy: that used
+// to leak the client's connection slot for good, and an upgraded stream
+// would escape the tunnel idle timeout entirely.
+func TestUpgradeResponseIsRefused(t *testing.T) {
+	e := newEnv(t, defaultAllow, nil)
+	var upgradeSeen atomic.Bool
+	ws := e.startTCP(t, func(c net.Conn) {
+		r, err := http.ReadRequest(bufio.NewReader(c))
+		if err != nil {
+			return
+		}
+		if r.Header.Get("Upgrade") != "" {
+			upgradeSeen.Store(true)
+		}
+		io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+		io.Copy(io.Discard, c)
+	})
+	const limit = 4
+	e.setConfig(t, defaultAllow, nil, map[string]any{"client_connections": limit})
+
+	// More attempts than the client may hold connections: one leaked slot
+	// per attempt would lock this client out of the proxy permanently.
+	for i := range 3 * limit {
+		code, err := e.get("http://allowed.test:" + ws + "/")
+		if err != nil || code != http.StatusBadGateway {
+			t.Fatalf("attempt %d: got %d, %v; want 502", i, code, err)
+		}
+	}
+	if upgradeSeen.Load() {
+		t.Error("the client's Upgrade header was forwarded upstream")
+	}
+	waitFor(t, "every slot to be released", func() bool { return e.connections() == 0 })
+	if code, err := e.get("http://allowed.test:" + e.plainPort + "/"); err != nil || code != 200 {
+		t.Fatalf("client locked out after the upgrade attempts: %d, %v", code, err)
+	}
+}
+
+// Headers that apply to a single connection must stop at the proxy, both
+// the fixed ones and whatever Connection itself names.
+func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
+	e := newEnv(t, defaultAllow, nil)
+	seen := make(chan http.Header, 1)
+	backend := e.startHTTP(t, func(_ http.ResponseWriter, r *http.Request) { seen <- r.Header.Clone() })
+	e.setConfig(t, defaultAllow, nil, nil)
+
+	c := e.dialProxy(t, "")
+	fmt.Fprintf(c, "GET http://allowed.test:%s/ HTTP/1.1\r\n"+
+		"Host: allowed.test\r\n"+
+		"Connection: Upgrade, X-Single-Hop\r\n"+
+		"Upgrade: websocket\r\n"+
+		"X-Single-Hop: dropped\r\n"+
+		"Keep-Alive: timeout=5\r\n"+
+		"Proxy-Authorization: Basic Zm9vOmJhcg==\r\n"+
+		"Proxy-Connection: keep-alive\r\n"+
+		"X-End-To-End: kept\r\n\r\n", backend)
+	if _, err := http.ReadResponse(bufio.NewReader(c), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	h := <-seen
+	for _, name := range []string{"Connection", "Upgrade", "X-Single-Hop", "Keep-Alive", "Proxy-Authorization", "Proxy-Connection"} {
+		if v := h.Get(name); v != "" {
+			t.Errorf("hop-by-hop header %s reached the destination as %q", name, v)
+		}
+	}
+	if got := h.Get("X-End-To-End"); got != "kept" {
+		t.Errorf("end-to-end header altered: %q", got)
+	}
+}
+
+// A client may send its first payload straight after CONNECT without
+// waiting for the 200. Those bytes land in the HTTP server's read buffer
+// along with the request, so the tunnel has to pick them up from there.
+func TestTunnelKeepsDataSentBeforeTheReply(t *testing.T) {
+	e := newEnv(t, defaultAllow, nil)
+	got := make(chan string, 1)
+	backend := e.startTCP(t, func(c net.Conn) {
+		b := make([]byte, 5)
+		if _, err := io.ReadFull(c, b); err != nil {
+			return
+		}
+		got <- string(b)
+		io.Copy(io.Discard, c)
+	})
+	e.setConfig(t, defaultAllow, nil, nil)
+
+	c := e.dialProxy(t, "")
+	// One write, so the request and the payload arrive together.
+	fmt.Fprintf(c, "CONNECT allowed.test:%s HTTP/1.1\r\nHost: x\r\n\r\nhello", backend)
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("tunnel not established: %v", err)
+	}
+	select {
+	case s := <-got:
+		if s != "hello" {
+			t.Errorf("destination received %q, want %q", s, "hello")
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("bytes sent before the 200 never reached the destination")
 	}
 }

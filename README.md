@@ -1,8 +1,12 @@
 # proxy-acl
 
-A forward HTTP/HTTPS proxy built on [goproxy](https://github.com/elazarl/goproxy)
-that enforces per-subnet destination rules. The YAML config reloads live when
-you edit it. **Everything is denied unless a rule explicitly allows it.**
+A forward HTTP/HTTPS proxy that enforces per-subnet destination rules. The
+YAML config reloads live when you edit it. **Everything is denied unless a
+rule explicitly allows it.**
+
+It is built on the standard library alone (plus YAML parsing, logging and
+file watching): the proxy itself is a few hundred lines, so everything the
+binary does with untrusted input is in this repository.
 
 - **HTTP**: every plain proxy request (`GET http://…`) is checked separately,
   including each request on a keep-alive connection.
@@ -64,6 +68,12 @@ The proxy also:
 - closes the client connection after a denied request;
 - answers with a generic `502` when an allowed destination can't be reached,
   and logs the actual error (which contains resolved addresses) instead;
+- strips the hop-by-hop headers (`Connection` and everything it names,
+  `Upgrade`, `Keep-Alive`, `Proxy-Authorization`, …) from what it forwards,
+  so protocol upgrades go through `CONNECT` or not at all. A destination
+  that answers a plain request with `101 Switching Protocols` anyway gets a
+  `502`: handing the client connection over would put the stream outside
+  the ACL's tunnel accounting and its idle timeout;
 - caps request headers at 64 KB and upstream response headers at 1 MB;
 - dials at most 3 addresses per IP family, IPv4 and IPv6 in parallel
   ("happy eyeballs"), within 30 s in total;
@@ -186,8 +196,10 @@ make build        # bin/proxy-acl
 make run          # dev mode, see below
 make test         # tests with the race detector
 make fuzz         # fuzz the ACL (FUZZTIME=60s)
+make lint         # the golangci-lint quality gate (.golangci.yml)
+make lint-fix     # apply the fixes the linters can make themselves
 make vulncheck    # known vulnerabilities in dependencies
-make check        # everything CI checks: formatting, vet, vulncheck, tests
+make check        # everything CI checks: formatting, vet, lint, vulncheck, tests
 make release      # release binaries and archives into dist/, as CI builds them
 make              # list all targets
 ```
@@ -214,11 +226,21 @@ to the config apply live. Point a client at it with
   anything the ACL didn't approve.
 
 `internal/proxy` also covers the limits end to end (unknown clients, slot
-release on every close path, rate limiting, tunnel idle timeout and
-half-close, dial fallback and budget, generic upstream errors, log
-sampling).
+release on every close path including refused protocol upgrades, rate
+limiting, tunnel idle timeout and half-close, dial fallback and budget,
+generic upstream errors, hop-by-hop header stripping, log sampling).
 
-CI runs formatting, vet, `govulncheck`, race tests and a fuzz pass, builds
+`make lint` downloads the golangci-lint version pinned as
+`GOLANGCI_VERSION` in the Makefile, which CI reads from there too, so local
+runs and CI can't drift apart. [`.golangci.yml`](.golangci.yml) keeps the
+set small: every linter in it either found a real problem here or guards a
+mistake that is expensive in a proxy (leaked connections, unchecked errors,
+requests without a context). Tests are exempt from the resource-handling
+linters only. Suppressions have to name the linter and say why, which
+`nolintlint` enforces — there is one, for the config file the operator
+names being read by path.
+
+CI runs formatting, vet, the lint gate, `govulncheck`, race tests and a fuzz pass, builds
 the release binaries for every platform and the Docker image, and
 smoke-tests the image (`checks.yml`). Pushes to `main` also publish the
 `:main` image (`ci.yml`, `image.yml`).

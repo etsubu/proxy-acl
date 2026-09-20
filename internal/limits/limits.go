@@ -17,6 +17,7 @@ type Client struct {
 	TunnelIdleTimeout time.Duration // close tunnels with no data in either direction
 }
 
+// Acquire returns these when a connection can't be admitted.
 var (
 	ErrTotalConnections  = errors.New("proxy connection limit reached")
 	ErrClientConnections = errors.New("client connection limit reached")
@@ -68,6 +69,7 @@ type Suppressed struct {
 	Other   int // lines beyond the distinct keys that are counted individually
 }
 
+// NewTracker returns an empty Tracker.
 func NewTracker() *Tracker {
 	return &Tracker{now: time.Now, clients: map[netip.Addr]*client{}, overflow: map[netip.Prefix]*client{}}
 }

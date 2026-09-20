@@ -4,11 +4,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,6 +24,14 @@ import (
 var version = "dev"
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal().Err(err).Msg("proxy-acl failed")
+	}
+}
+
+// run is separate from main so that every failure path unwinds the defers
+// instead of exiting from under them.
+func run() error {
 	configPath := flag.String("config", "config.yaml", "path to the YAML ACL config (reloaded on change and on SIGHUP)")
 	listen := flag.String("listen", ":3128", "listen address")
 	logFormat := flag.String("log-format", "json", "log format: json or console")
@@ -33,7 +39,7 @@ func main() {
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
-		return
+		return nil
 	}
 
 	zerolog.TimeFieldFormat = time.RFC3339
@@ -42,46 +48,30 @@ func main() {
 	case "console":
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.DateTime})
 	default:
-		log.Fatal().Str("log_format", *logFormat).Msg("unknown log format")
+		return fmt.Errorf("unknown log format %q", *logFormat)
 	}
 
-	store, err := config.NewStore(*configPath)
+	// The log level lives in the config file, so every load applies it here
+	// rather than from inside the store.
+	store, err := config.NewStore(*configPath, func(cfg *config.Config) {
+		zerolog.SetGlobalLevel(cfg.LogLevel)
+	})
 	if err != nil {
-		log.Fatal().Err(err).Str("path", *configPath).Msg("failed to load config")
+		return fmt.Errorf("load config %s: %w", *configPath, err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if err := store.Watch(ctx); err != nil {
-		log.Fatal().Err(err).Msg("failed to watch config")
+		return fmt.Errorf("watch config: %w", err)
 	}
 
-	p := proxy.New(store.Current, dnscache.New(net.DefaultResolver))
-	go p.Maintain(ctx)
-
-	srv := &http.Server{
-		Handler: p,
-		// No read/write timeouts: a proxy can't know how long a legitimate
-		// upload or download takes. Tunnels are hijacked and have their own
-		// idle timeout.
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       time.Minute,
-		MaxHeaderBytes:    64 << 10,
-	}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-
-	ln, err := net.Listen("tcp", *listen)
+	ln, err := new(net.ListenConfig).Listen(ctx, "tcp", *listen)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to listen")
+		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
 	log.Info().Str("listen", *listen).Str("version", version).Msg("proxy listening")
-	if err := srv.Serve(p.Listener(ln)); !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal().Err(err).Msg("server failed")
-	}
+
+	return proxy.New(store.Current, dnscache.New(net.DefaultResolver)).Serve(ctx, ln)
 }

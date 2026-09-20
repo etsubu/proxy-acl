@@ -16,7 +16,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	log.Logger = zerolog.Nop() // reloads reset the global level, so silence the logger itself
+	log.Logger = zerolog.Nop()
 	os.Exit(m.Run())
 }
 
@@ -176,7 +176,7 @@ subnets:
 func TestStoreHotReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	writeFile(t, path, reloadConfig)
-	store, err := NewStore(path)
+	store, err := NewStore(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,10 +234,10 @@ func TestStoreHotReload(t *testing.T) {
 func TestNewStoreFailsOnInvalidConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	writeFile(t, path, "subnets: [")
-	if _, err := NewStore(path); err == nil {
+	if _, err := NewStore(path, nil); err == nil {
 		t.Error("expected an error")
 	}
-	if _, err := NewStore(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
+	if _, err := NewStore(filepath.Join(t.TempDir(), "missing.yaml"), nil); err == nil {
 		t.Error("expected an error for a missing file")
 	}
 }
@@ -266,16 +266,23 @@ subnets:
 	if cfg.TotalConnections != 5000 {
 		t.Errorf("TotalConnections = %d", cfg.TotalConnections)
 	}
+	// Limits are looked up by the subnet a client belongs to, so the lookup
+	// is exercised the same way a request does it.
+	limitsFor := func(c *Config, client string) limits.Client {
+		return c.ClientLimits(c.Policy.SubnetOf(netip.MustParseAddr(client)))
+	}
 	lan := limits.Client{MaxConnections: 512, RequestsPerSecond: 50, RequestBurst: 1000, TunnelIdleTimeout: 90 * time.Second}
-	for subnet, want := range map[string]limits.Client{
-		"lan":        lan,
-		"iot":        {MaxConnections: 64, RequestsPerSecond: 50, RequestBurst: 1000, TunnelIdleTimeout: 0},
-		"subnet[2]":  {MaxConnections: 512, RequestsPerSecond: 50, RequestBurst: 20, TunnelIdleTimeout: 90 * time.Second},
-		"":           lan, // clients outside every subnet
-		"not-listed": lan,
+	for _, tt := range []struct {
+		name, client string
+		want         limits.Client
+	}{
+		{"lan", "10.0.1.5", lan},
+		{"iot", "10.0.20.5", limits.Client{MaxConnections: 64, RequestsPerSecond: 50, RequestBurst: 1000, TunnelIdleTimeout: 0}},
+		{"unnamed subnet", "10.0.30.5", limits.Client{MaxConnections: 512, RequestsPerSecond: 50, RequestBurst: 20, TunnelIdleTimeout: 90 * time.Second}},
+		{"outside every subnet", "192.0.2.1", lan},
 	} {
-		if got := cfg.ClientLimits(subnet); got != want {
-			t.Errorf("%q: %+v, want %+v", subnet, got, want)
+		if got := limitsFor(cfg, tt.client); got != tt.want {
+			t.Errorf("%s (%s): %+v, want %+v", tt.name, tt.client, got, tt.want)
 		}
 	}
 
@@ -283,8 +290,8 @@ subnets:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if def.TotalConnections != DefaultTotalConnections || def.ClientLimits("subnet[0]") != DefaultClientLimits {
-		t.Errorf("defaults: %d %+v", def.TotalConnections, def.ClientLimits("subnet[0]"))
+	if def.TotalConnections != DefaultTotalConnections || limitsFor(def, "10.0.0.5") != DefaultClientLimits {
+		t.Errorf("defaults: %d %+v", def.TotalConnections, limitsFor(def, "10.0.0.5"))
 	}
 }
 

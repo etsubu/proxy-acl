@@ -293,8 +293,9 @@ func isNumeric(l string) bool {
 			return true
 		}
 		for i := 0; i < len(l); i++ {
-			c := l[i]
-			if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			switch c := l[i]; {
+			case '0' <= c && c <= '9', 'a' <= c && c <= 'f':
+			default:
 				return false
 			}
 		}

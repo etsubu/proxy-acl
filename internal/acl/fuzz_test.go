@@ -88,8 +88,9 @@ func FuzzCheck(f *testing.F) {
 			return
 		}
 		for i := 0; i < len(host); i++ {
-			c := host[i]
-			if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '_' || c == '.') {
+			switch c := host[i]; {
+			case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9', c == '-', c == '_', c == '.':
+			default:
 				t.Fatalf("host %q with byte %q allowed", host, c)
 			}
 		}

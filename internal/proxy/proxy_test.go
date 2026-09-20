@@ -102,7 +102,7 @@ func (f *fakeResolver) lookups() int {
 }
 
 type env struct {
-	proxy     *httptest.Server
+	addr      string // the proxy's listen address
 	p         *Proxy
 	plain     *httptest.Server // allowed port
 	secure    *httptest.Server // allowed port, TLS
@@ -130,7 +130,7 @@ func newEnv(t *testing.T, allow, deny []string) *env {
 		e.res.table[name] = netip.MustParseAddr("127.0.0.1")
 	}
 
-	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backend := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		e.hits.Add(1)
 		io.WriteString(w, "backend")
 	})
@@ -153,11 +153,29 @@ func newEnv(t *testing.T, allow, deny []string) *env {
 
 	e.setConfig(t, allow, deny, nil)
 	e.p = New(e.cfg.Load, e.res)
-	e.proxy = httptest.NewUnstartedServer(e.p)
-	e.proxy.Listener = e.p.Listener(e.proxy.Listener)
-	e.proxy.Start()
-	t.Cleanup(e.proxy.Close)
+	e.addr = serve(t, e.p)
 	return e
+}
+
+// serve runs p on a loopback listener until the test ends, exactly as main
+// does, and returns its address. Going through Serve means the tests
+// exercise the connection vetting and the real HTTP server settings.
+func serve(t *testing.T, p *Proxy) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := p.Serve(ctx, ln); err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	return ln.Addr().String()
 }
 
 // setConfig installs a config for the test subnet. limits overrides the
@@ -202,7 +220,7 @@ func port(rawURL string) string {
 }
 
 func (e *env) client() *http.Client {
-	proxyURL, _ := url.Parse(e.proxy.URL)
+	proxyURL, _ := url.Parse("http://" + e.addr)
 	return &http.Client{Transport: &http.Transport{
 		Proxy:           http.ProxyURL(proxyURL),
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // test cert isn't for these names
@@ -226,7 +244,7 @@ func (e *env) get(rawURL string) (int, error) {
 // returns the status code of each response (0 once the connection fails).
 func (e *env) raw(t *testing.T, reqs ...string) []int {
 	t.Helper()
-	conn, err := net.Dial("tcp", e.proxy.Listener.Addr().String())
+	conn, err := net.Dial("tcp", e.addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,13 +438,6 @@ func TestPolicyChangesApplyToNextRequest(t *testing.T) {
 
 func TestDialerFailsClosed(t *testing.T) {
 	e := newEnv(t, defaultAllow, nil)
-	p := New(e.cfg.Load, e.res)
-
-	// The outbound transport refuses requests that didn't pass the ACL.
-	req, _ := http.NewRequest(http.MethodGet, e.plain.URL, nil)
-	if _, err := p.Tr.RoundTrip(req); !errors.Is(err, errNotVetted) {
-		t.Errorf("unvetted RoundTrip: %v, want errNotVetted", err)
-	}
 
 	// A vetted destination only dials the exact host:port that was checked.
 	v := &vetted{host: "allowed.test", port: 443, addrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")}}
@@ -434,6 +445,13 @@ func TestDialerFailsClosed(t *testing.T) {
 		if _, err := v.dial(context.Background(), "tcp", addr); !errors.Is(err, errNotVetted) {
 			t.Errorf("dial %q: %v, want errNotVetted", addr, err)
 		}
+	}
+	// Upstream requests go through that same guard: a pooled transport can
+	// only reach the destination its vetted approved. Sending a request
+	// without one doesn't compile, so there is no unvetted path to test.
+	req, _ := http.NewRequest(http.MethodGet, "http://other.test:443/", nil)
+	if _, err := newUpstreamPools().roundTrip(req, v); !errors.Is(err, errNotVetted) {
+		t.Errorf("roundTrip to a host the vetted doesn't cover: %v, want errNotVetted", err)
 	}
 	if e.hits.Load() != 0 {
 		t.Error("backend reached")
@@ -443,9 +461,14 @@ func TestDialerFailsClosed(t *testing.T) {
 func TestIgnoresUpstreamProxyEnvironment(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
-	p := New(func() *config.Config { return nil }, &fakeResolver{})
-	if p.ConnectDial != nil || p.ConnectDialWithReq != nil || p.Tr.Proxy != nil {
-		t.Error("proxy would chain to an upstream proxy instead of dialing vetted addresses")
+	e := newEnv(t, defaultAllow, nil)
+	// The upstream transports are built here rather than taken from
+	// net/http's defaults, so nothing chains to the environment's proxy.
+	if tr := newUpstreamTransport(nil); tr.Proxy != nil {
+		t.Error("upstream transport reads the environment's proxy settings")
+	}
+	if code, err := e.get("http://allowed.test:" + e.plainPort + "/"); err != nil || code != 200 {
+		t.Fatalf("request did not go straight to the vetted address: %d, %v", code, err)
 	}
 }
 

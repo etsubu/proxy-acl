@@ -17,10 +17,12 @@ import (
 	"proxy-acl/internal/limits"
 )
 
-// Defaults are deliberately generous: they are meant to contain a
-// misbehaving device, not to throttle normal use.
+// DefaultTotalConnections and DefaultClientLimits are deliberately
+// generous: they are meant to contain a misbehaving device, not to throttle
+// normal use.
 const DefaultTotalConnections = 20_000
 
+// DefaultClientLimits is the per-client limit set a config starts from.
 var DefaultClientLimits = limits.Client{
 	MaxConnections:    512,
 	RequestsPerSecond: 200,
@@ -35,11 +37,12 @@ type Config struct {
 	TotalConnections int // 0: unlimited
 
 	clientLimits limits.Client
-	subnetLimits map[string]limits.Client
+	subnetLimits map[*acl.Subnet]limits.Client
 }
 
-// ClientLimits returns the per-client limits for a subnet.
-func (c *Config) ClientLimits(subnet string) limits.Client {
+// ClientLimits returns the per-client limits for a subnet, or the top-level
+// limits for a nil subnet (a client outside every subnet).
+func (c *Config) ClientLimits(subnet *acl.Subnet) limits.Client {
 	if l, ok := c.subnetLimits[subnet]; ok {
 		return l
 	}
@@ -108,7 +111,9 @@ func (d *duration) UnmarshalYAML(n *yaml.Node) error {
 
 // Load reads and validates the config file at path.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	// G304: reading the file the operator names is what this program is
+	// for; the path comes from a flag, never from a proxied request.
+	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied config path
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +138,7 @@ func Parse(data []byte) (*Config, error) {
 		return nil, errors.New("config must be a single YAML document")
 	}
 
-	cfg := &Config{LogLevel: zerolog.InfoLevel, TotalConnections: DefaultTotalConnections, subnetLimits: map[string]limits.Client{}}
+	cfg := &Config{LogLevel: zerolog.InfoLevel, TotalConnections: DefaultTotalConnections, subnetLimits: map[*acl.Subnet]limits.Client{}}
 	if f.LogLevel != "" {
 		lvl, err := zerolog.ParseLevel(f.LogLevel)
 		if err != nil {
@@ -154,18 +159,19 @@ func Parse(data []byte) (*Config, error) {
 
 	specs := make([]acl.SubnetSpec, len(f.Subnets))
 	for i, s := range f.Subnets {
-		if s.Name == "" {
-			s.Name = fmt.Sprintf("subnet[%d]", i)
-		}
 		specs[i] = acl.SubnetSpec{Name: s.Name, CIDRs: s.CIDRs, Ports: s.Ports, Allow: s.Allow, Deny: s.Deny}
-		l, err := s.Limits.apply(cfg.clientLimits)
-		if err != nil {
-			return nil, fmt.Errorf("subnet %q: limits: %w", s.Name, err)
-		}
-		cfg.subnetLimits[s.Name] = l
 	}
 	if cfg.Policy, err = acl.New(specs); err != nil {
 		return nil, err
+	}
+	// acl.New names unnamed subnets and keeps them in config order, so the
+	// limits are attached to the compiled subnets rather than to a name.
+	for i, s := range cfg.Policy.Subnets() {
+		l, err := f.Subnets[i].Limits.apply(cfg.clientLimits)
+		if err != nil {
+			return nil, fmt.Errorf("subnet %q: limits: %w", s.Name(), err)
+		}
+		cfg.subnetLimits[s] = l
 	}
 	return cfg, nil
 }
