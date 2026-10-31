@@ -5,7 +5,7 @@ go 1.27.1
 require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/rs/zerolog v1.35.1
-	go.yaml.in/yaml/v3 v3.0.5
+	go.yaml.in/yaml/v3 v3.0.6
 )
 
 require (
